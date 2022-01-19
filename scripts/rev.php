@@ -159,11 +159,13 @@ class FileStatusInfo
 
 class FileStatusEnum
 {
-    const Untranslated      = 'Untranslated';
     const RevTagProblem     = 'RevTagProblem';
     const TranslatedWip     = 'TranslatedWip';
     const TranslatedOk      = 'TranslatedOk';
     const TranslatedOld     = 'TranslatedOld';
+
+    // Unused
+    const Untranslated      = 'Untranslated';
     const TranslatedCritial = 'TranslatedCritial';
     const NotInEnTree       = 'NotInEnTree';
 }
@@ -436,10 +438,11 @@ function captureGitValues( & $output )
     global $DOCS;
     $cwd = getcwd();
     chdir( $DOCS . 'en' );
-    $fp = popen( "git --no-pager log --no-renames --numstat" , "r" );
-    $hash = $filename = $additions = $deletions = null;
+    $fp = popen( "git --no-pager log --name-only" , "r" );
+    $hash = null;
+    $date = null;
+    $utct = new DateTimeZone( "UTC" );
     $skipThisCommit = false;
-
     while ( ( $line = fgets( $fp ) ) !== false )
     {
         if ( substr( $line , 0 , 7 ) == "commit " )
@@ -449,7 +452,10 @@ function captureGitValues( & $output )
             continue;
         }
         if ( strpos( $line , 'Date:' ) === 0 )
+        {
+            $date = trim( substr( $line , 5 ) );
             continue;
+        }
         if ( trim( $line ) == "" )
             continue;
         if ( substr( $line , 0 , 4 ) == '    ' )
@@ -462,16 +468,11 @@ function captureGitValues( & $output )
         }
         if ( strpos( $line , ': ' ) > 0 )
             continue;
-        preg_match('/(\d+)\s+(\d+)\s*(.+)\s*/', $line, $matches);
-        if ($matches) {
-            [$all, $additions, $deletions, $filename] = $matches;
-        }
+        $filename = trim( $line );
         if ( isset( $output[$filename] ) )
             continue;
         $output[$filename]['hash'] = $hash;
         $output[$filename]['skip'] = $skipThisCommit;
-        $output[$filename]['adds'] = $additions;
-        $output[$filename]['dels'] = $deletions;
     }
     pclose( $fp );
     chdir( $cwd );
@@ -503,8 +504,6 @@ foreach( $enFiles as $key => $en )
     {
         $en->hash = $gitData[ $filename ]['hash'];
         $en->skip = $gitData[ $filename ]['skip'];
-        $en->adds = $gitData[ $filename ]['adds'];
-        $en->dels = $gitData[ $filename ]['dels'];
     }
     else
         print "Warn: No hash for en/$filename\n";
@@ -513,32 +512,62 @@ foreach( $enFiles as $key => $en )
 
     foreach( $LANGS as $lang )
     {
-        $trFile = isset( $trFiles[$lang][$filename] ) ? $trFiles[$lang][$filename] : null;
-        if ( $trFile == null ) // Untranslated
-        {
+        $trFile = $trFiles[$lang][$filename] ?? null;
+
+        if (!$trFile) {
             $SQL_BUFF .= "INSERT INTO Untranslated VALUES ($id, '$lang',
             '$en->name', $size);\n";
-        } else {
-            $additions = $deletions = 0;
-            if ( $en->hash == $trFile->hash ){
-                $trFile->syncStatus = FileStatusEnum::TranslatedOk;
-            } elseif ( $trFile->hash != null and strlen( $trFile->hash ) == 40 ) {
-                $trFile->syncStatus = FileStatusEnum::TranslatedOld;
-            }
-            if ( $trFile->completion != null && $trFile->completion != "ready" )
-                $trFile->syncStatus = FileStatusEnum::TranslatedWip;
-            if ( $en->skip ) {
-                $cwd = getcwd();
-                chdir( $DOCS . 'en' );
-                $hashes = explode ( "\n" , `git log -2 --format=%H -- {$filename}` );
-                chdir( $cwd );
-                if ( $hashes[1] == $trFile->hash )
-                    $trFile->syncStatus = FileStatusEnum::TranslatedOk;
-            }
+
+            continue;
+        }
+
+        // If the syncStatus is set, a problem was already identified.
+        if ($trFile->syncStatus) {
             $SQL_BUFF .= "INSERT INTO translated VALUES ($id, '$lang',
             '$en->name', '$trFile->hash', $size, '$trFile->maintainer',
-            '$trFile->completion', '$trFile->syncStatus', $en->adds, $en->dels);\n";
+            '$trFile->completion', '$trFile->syncStatus', 0, 0);\n";
+
+            continue;
         }
+
+        // Use parent commit hash marked as skip.
+        // FIXME: Handle consecutive skips, maybe in captureGitValues().
+        $previousEnHash = $en->hash;
+        if ($en->skip) {
+            $cwd = getcwd();
+            chdir($DOCS . 'en');
+            $hashes = explode ("\n", `git log -2 --format=%H -- {$filename}`);
+            chdir($cwd);
+            $previousEnHash = $hashes[1];
+        }
+
+        $additions = $deletions = 0;
+        if ($trFile->hash !== $en->hash && $trFile->hash !== $previousEnHash) {
+            $cwd = getcwd();
+            chdir($DOCS . 'en');
+            $stats = `git diff --numstat $trFile->hash -- {$filename}`;
+            chdir($cwd);
+
+            preg_match('/(\d+)\s+(\d+)/', $stats, $matches);
+            if (count($matches) === 3) {
+                [, $additions, $deletions] = $matches;
+            }
+        }
+
+        $trFile->syncStatus = FileStatusEnum::TranslatedOk;
+
+        if ($additions !== 0 || $deletions !== 0) {
+            $trFile->syncStatus = FileStatusEnum::TranslatedOld;
+        }
+
+        // Override status if WIP
+        if ($trFile->completion && $trFile->completion !== "ready") {
+            $trFile->syncStatus = FileStatusEnum::TranslatedWip;
+        }
+
+        $SQL_BUFF .= "INSERT INTO translated VALUES ($id, '$lang',
+        '$en->name', '$trFile->hash', $size, '$trFile->maintainer',
+        '$trFile->completion', '$trFile->syncStatus', $additions, $deletions);\n";
     }
 }
 
@@ -564,7 +593,7 @@ try {
     $db = new SQLite3($tmp_db);
     /* Didn't throw exception at some point? */
     if (!$db) {
-        throw Exception("Cant open $tmp_db");
+        throw new Exception("Cant open $tmp_db");
     }
 
 } catch(Exception $e) {
